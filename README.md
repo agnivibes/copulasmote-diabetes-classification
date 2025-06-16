@@ -1,4 +1,4 @@
-#Copula-Based Oversampling for Imbalanced Diabetes Classification 🧬📊
+## CopulaSMOTE: A Copula-Based Oversampling Approach for Imbalanced Classification in Diabetes Prediction 🧬📊
 
 [![Python](https://img.shields.io/badge/Python-3.11+-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![scikit-learn](https://img.shields.io/badge/ML-scikit--learn%20%7C%20XGBoost%20%7C%20LogReg-orange)](https://scikit-learn.org/stable/)
@@ -26,13 +26,13 @@ python main.py
 ```
 
 ## 🔬 Research Paper
-Aich, A., Murshed, Murshed, M., Hewage, S. (2025). CopulaSMOTE: A Copula-Based Oversampling Strategy for Imbalanced Diabetes Classification. [Manuscript under review]
+Aich, A., Murshed, Murshed, M., Hewage, S. (2025). CopulaSMOTE: A Copula-Based Oversampling Approach for Imbalanced Classification in Diabetes Prediction. [Manuscript under review]
 
 ## 📊 Citation
 If you use this code or method in your own work, please cite:
 
 @article{Aich2025CopulaSMOTE,
-  title   = {CopulaSMOTE: A Copula-Based Oversampling Strategy for Imbalanced Diabetes Classification},
+  title   = {CopulaSMOTE: A Copula-Based Oversampling Approach for Imbalanced Classification in Diabetes Prediction},
   author  = {Aich, Agnideep, Murshed, Monzur Md. and Hewage, Sameera},
   year    = {2025},
   note    = {Manuscript under review}
