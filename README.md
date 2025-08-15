@@ -26,14 +26,14 @@ python main.py
 ```
 
 ## 🔬 Research Paper
-Aich, A., Murshed, Murshed, M., Hewage, S. (2025). CopulaSMOTE: A Copula-Based Oversampling Approach for Imbalanced Classification in Diabetes Prediction. [Manuscript under review]
+Aich, A., Murshed, Murshed, M., Hewage, S. and Mayeaux, A.(2025). CopulaSMOTE: A Copula-Based Oversampling Approach for Imbalanced Classification in Diabetes Prediction. [Manuscript under review]
 
 ## 📊 Citation
 If you use this code or method in your own work, please cite:
 
 @article{Aich2025CopulaSMOTE,
   title   = {CopulaSMOTE: A Copula-Based Oversampling Approach for Imbalanced Classification in Diabetes Prediction},
-  author  = {Aich, Agnideep, Murshed, Monzur Md. and Hewage, Sameera},
+  author  = {Aich, Agnideep, Murshed, Monzur Md., Hewage, Sameera and Mayeaux, Amanda},
   year    = {2025},
   note    = {Manuscript under review}
 }
