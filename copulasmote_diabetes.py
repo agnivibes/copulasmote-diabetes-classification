@@ -355,6 +355,10 @@ def plot_confusion_matrices(smote_models: Dict[str, object],
         ax_top = axes[0, i]
         im_top = ax_top.imshow(cm_sm, interpolation="nearest", cmap="Blues",
                                vmin=0, vmax=vmax_pair)
+        ax_top.set_xticks([0, 1]);
+        ax_top.set_yticks([0, 1])
+        ax_top.set_xticklabels(["0", "1"]);
+        ax_top.set_yticklabels(["0", "1"])
         ax_top.set_title(f"{name} (SMOTE)")
         ax_top.set_xlabel("Predicted"); ax_top.set_ylabel("True")
         for (r, c), v in np.ndenumerate(cm_sm):
@@ -365,6 +369,10 @@ def plot_confusion_matrices(smote_models: Dict[str, object],
         ax_bot = axes[1, i]
         im_bot = ax_bot.imshow(cm_a2, interpolation="nearest", cmap="Oranges",
                                vmin=0, vmax=vmax_pair)
+        ax_bot.set_xticks([0, 1]);
+        ax_bot.set_yticks([0, 1])
+        ax_bot.set_xticklabels(["0", "1"]);
+        ax_bot.set_yticklabels(["0", "1"])
         ax_bot.set_title(f"{name} (A2 {title_suffix})")
         ax_bot.set_xlabel("Predicted"); ax_bot.set_ylabel("True")
         for (r, c), v in np.ndenumerate(cm_a2):
@@ -742,7 +750,7 @@ def main():
             table = np.array([[n11, n10],
                               [n01, n00]], dtype=int)
 
-            # Use exact two-sided (recommended with small discordant counts)
+            # Use exact two-sided
             mc = mcnemar(table, exact=True)
             chi2_val = float(mc.statistic) if mc.statistic is not None else float("nan")
 
