@@ -501,8 +501,8 @@ def plot_mcnemar_contingency(table: np.ndarray, chi2: float, p: float, out_path:
     im = ax.imshow(table, cmap="Blues", vmin=0)
 
     ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
-    ax.set_xticklabels(["Both Correct", "SMOTE Only Correct"], rotation=20)
-    ax.set_yticklabels(["A2 Only Correct", "Both Incorrect"])
+    ax.set_xticklabels(["A2 correct", "A2 incorrect"], rotation=20)
+    ax.set_yticklabels(["SMOTE correct", "SMOTE incorrect"])
 
     for (r, c), v in np.ndenumerate(table):
         ax.text(c, r, str(v), ha="center", va="center", fontsize=12, fontweight="bold")
@@ -624,9 +624,9 @@ def main():
     # Prepare dicts storing scaled train/test per theta
     A2_scaled_by_theta: Dict[int, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
 
-    # We'll also save fitted models at θ=10 for confusion matrices and McNemar
+    # We'll save SMOTE models once and A2 models per-theta
     models_smote = {}
-    models_a2_t10 = {}
+    models_a2_by_theta = {}  # dict[int -> dict[str->fitted model]]
 
     models_dict = get_models()
 
@@ -653,12 +653,11 @@ def main():
         # Store for ROC plotting
         A2_scaled_by_theta[theta] = (Xa2_tr_scaled, ya2_tr, Xa2_te_scaled)
 
-        # Train/save models at θ=10 for confusion matrices & McNemar
-        if theta == 10:
-            for name, model in models_dict.items():
-                m = clone(model)
-                m.fit(Xa2_tr_scaled, ya2_tr)
-                models_a2_t10[name] = m
+        # Train/save models for THIS theta for confusion matrices & McNemar
+        models_a2_by_theta[theta] = {
+            name: clone(model).fit(Xa2_tr_scaled, ya2_tr)
+            for name, model in models_dict.items()
+        }
 
     # Also train/save SMOTE models for confusion matrices & McNemar
     for name, model in models_dict.items():
@@ -666,21 +665,39 @@ def main():
         m.fit(X_tr_res_scaled, y_tr_res)
         models_smote[name] = m
 
-    # 5) Metrics tables (SMOTE vs A2 θ=10 on SAME test set)
-    # Evaluate SMOTE models
-    sm_metrics = evaluate_models(models_smote, X_tr_res_scaled, y_tr_res, X_te_sm_scaled, y_te)
-    # Evaluate A2 θ=10 models
-    Xa2_tr_t10, ya2_tr_t10, Xa2_te_t10 = A2_scaled_by_theta[10]
-    a2_metrics = evaluate_models(models_a2_t10, Xa2_tr_t10, ya2_tr_t10, Xa2_te_t10, y_te)
 
-    metrics_table = pd.concat({"A2": a2_metrics, "SMOTE": sm_metrics}, names=["Method", "Model"])
-    metrics_csv = os.path.join(OUT_DIR, "metrics_table.csv")
-    metrics_table.to_csv(metrics_csv, float_format="%.4f")
+    # 5) Metrics tables for every theta (A2 vs SMOTE) on SAME test set
+    sm_metrics = evaluate_models(models_smote, X_tr_res_scaled, y_tr_res, X_te_sm_scaled, y_te)
+
+    all_metrics = []
+    for theta in THETAS:
+        Xa2_tr_t, ya2_tr_t, Xa2_te_t = A2_scaled_by_theta[theta]
+        a2_metrics_t = evaluate_models(models_a2_by_theta[theta], Xa2_tr_t, ya2_tr_t, Xa2_te_t, y_te)
+
+        a2_metrics_t["Method"] = "A2"
+        a2_metrics_t["Theta"] = theta
+        sm_metrics_t = sm_metrics.copy()
+        sm_metrics_t["Method"] = "SMOTE"
+        sm_metrics_t["Theta"] = theta
+
+        all_metrics.append(pd.concat([a2_metrics_t, sm_metrics_t]))
+
+    metrics_all = pd.concat(all_metrics).reset_index().rename(columns={"index": "Model"})
+    metrics_csv = os.path.join(OUT_DIR, "metrics_table_by_theta.csv")
+    metrics_all.to_csv(metrics_csv, index=False, float_format="%.4f")
 
     # 6) Confusion matrices (θ=10)
-    cm_pdf = os.path.join(OUT_DIR, "confusion_matrices.pdf")
-    plot_confusion_matrices(models_smote, models_a2_t10, X_te_sm_scaled, y_te, Xa2_te_t10,
-                            title_suffix="θ=10", out_path=cm_pdf)
+    # 6) Confusion matrices for each theta
+    cm_pdfs = []
+    for theta in THETAS:
+        _, _, Xa2_te_t = A2_scaled_by_theta[theta]
+        cm_pdf_t = os.path.join(OUT_DIR, f"confusion_matrices_theta{theta}.pdf")
+        plot_confusion_matrices(
+            models_smote, models_a2_by_theta[theta],
+            X_te_sm_scaled, y_te, Xa2_te_t,
+            title_suffix=f"θ={theta}", out_path=cm_pdf_t
+        )
+        cm_pdfs.append((theta, cm_pdf_t))
 
     # 7) ROC curves for θ ∈ {2,5,10}
     roc_pdf = os.path.join(OUT_DIR, "roc_multi_theta.pdf")
@@ -703,51 +720,65 @@ def main():
                                      feature_1=FEATURE_1, feature_2=FEATURE_2,
                                      n_samples=500, out_path=copula_pdf)
 
-    # 9) McNemar’s test comparing XGB (θ=10 A2) vs XGB (SMOTE) on SAME test set
-    xgb_sm = models_smote["XGB"]
-    xgb_a2 = models_a2_t10["XGB"]
-    yhat_sm = xgb_sm.predict(X_te_sm_scaled)
-    yhat_a2 = xgb_a2.predict(Xa2_te_t10)
+    # 9) McNemar’s test per model and per theta (A2 θ vs SMOTE) on SAME test set
+    mcnemar_summaries = []
+    for theta in THETAS:
+        _, _, Xa2_te_t = A2_scaled_by_theta[theta]
+        for model_name in ["RF", "MLP", "XGB"]:  # adjust list if desired
+            sm = models_smote[model_name]
+            a2 = models_a2_by_theta[theta][model_name]
 
-    # Build contingency table using correctness vs the TRUE y_te
-    # n01: A2 correct, SMOTE incorrect
-    # n10: SMOTE correct, A2 incorrect
-    a2_correct = (yhat_a2 == y_te)
-    sm_correct = (yhat_sm == y_te)
-    n01 = np.sum(a2_correct & ~sm_correct)
-    n10 = np.sum(~a2_correct & sm_correct)
-    n11 = np.sum(a2_correct & sm_correct)
-    n00 = np.sum(~a2_correct & ~sm_correct)
+            yhat_sm = sm.predict(X_te_sm_scaled)
+            yhat_a2 = a2.predict(Xa2_te_t)
 
-    table = np.array([[n11, n10],
-                      [n01, n00]], dtype=int)
+            a2_correct = (yhat_a2 == y_te)
+            sm_correct = (yhat_sm == y_te)
 
-    mc = mcnemar(table, exact=True)
-    mcnemar_json = {
-        "contingency_table": {"n11_both_correct": int(n11),
-                              "n10_smote_only_correct": int(n10),
-                              "n01_a2_only_correct": int(n01),
-                              "n00_both_incorrect": int(n00)},
-        "statistic": float(mc.statistic if mc.statistic is not None else float("nan")),
-        "p_value": float(mc.pvalue)
-    }
-    with open(os.path.join(OUT_DIR, "mcnemar.json"), "w") as f:
-        json.dump(mcnemar_json, f, indent=2)
+            n01 = int(np.sum(a2_correct & ~sm_correct))  # A2 only correct
+            n10 = int(np.sum(~a2_correct & sm_correct))  # SMOTE only correct
+            n11 = int(np.sum(a2_correct & sm_correct))
+            n00 = int(np.sum(~a2_correct & ~sm_correct))
 
-    contingency_pdf = os.path.join(OUT_DIR, "mcnemar_contingency.pdf")
-    chi2_val = float(mc.statistic) if mc.statistic is not None else float("nan")
-    plot_mcnemar_contingency(table, chi2=chi2_val, p=float(mc.pvalue), out_path=contingency_pdf)
+            table = np.array([[n11, n10],
+                              [n01, n00]], dtype=int)
+
+            # Use exact two-sided (recommended with small discordant counts)
+            mc = mcnemar(table, exact=True)
+            chi2_val = float(mc.statistic) if mc.statistic is not None else float("nan")
+
+            json_path = os.path.join(OUT_DIR, f"mcnemar_{model_name}_theta{theta}.json")
+            fig_path = os.path.join(OUT_DIR, f"mcnemar_contingency_{model_name}_theta{theta}.pdf")
+
+            with open(json_path, "w") as f:
+                json.dump({
+                    "model": model_name,
+                    "theta": theta,
+                    "contingency_table": {
+                        "n11_both_correct": n11,
+                        "n10_smote_only_correct": n10,
+                        "n01_a2_only_correct": n01,
+                        "n00_both_incorrect": n00
+                    },
+                    "statistic": chi2_val,
+                    "p_value": float(mc.pvalue)
+                }, f, indent=2)
+
+            plot_mcnemar_contingency(table, chi2=chi2_val, p=float(mc.pvalue), out_path=fig_path)
+            mcnemar_summaries.append((theta, model_name, json_path, fig_path, n10, n01, float(mc.pvalue)))
 
     # 10) Save a short README with paths
     with open(os.path.join(OUT_DIR, "README.txt"), "w", encoding="utf-8") as f:
         f.write("Outputs generated by CopulaSMOTE revision pipeline\n")
-        f.write(f"- Metrics table: {metrics_csv}\n")
-        f.write(f"- Confusion matrices (θ=10): {cm_pdf}\n")
+        f.write(f"- Metrics table (all thetas): {metrics_csv}\n")
+        for theta, cm_pdf_t in cm_pdfs:
+            f.write(f"- Confusion matrices (θ={theta}): {cm_pdf_t}\n")
         f.write(f"- ROC curves (θ in {THETAS}): {roc_pdf}\n")
         f.write(f"- Precision–Recall curves (θ in {THETAS}): {pr_pdf}\n")
         f.write(f"- Copula sample plots: {copula_pdf}\n")
-        f.write(f"- McNemar results: {os.path.join(OUT_DIR, 'mcnemar.json')}\n")
-        f.write(f"- McNemar contingency figure: {contingency_pdf}\n")
+        for theta, model_name, json_path, fig_path, n10, n01, p in mcnemar_summaries:
+            f.write(f"- McNemar ({model_name}, θ={theta}): n10={n10}, n01={n01}, p={p:.4g}\n")
+            f.write(f"  JSON: {json_path}\n")
+            f.write(f"  Figure: {fig_path}\n")
 
     print("✓ Done. Outputs written to:", OUT_DIR)
 
