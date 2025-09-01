@@ -6,9 +6,16 @@
 [![SMOTE](https://img.shields.io/badge/Oversampling-SMOTE-ff69b4)](https://imbalanced-learn.org/stable/references/generated/imblearn.over_sampling.SMOTE.html)
 [![Dataset](https://img.shields.io/badge/Data-PIMA%20Diabetes-yellowgreen)](https://www.kaggle.com/datasets/gzdekzlkaya/pima-indians-diabetes-dataset)
 
-This repository contains the full implementation of a machine learning pipeline that addresses class imbalance in diabetes classification by leveraging copula-based data generation. We generate synthetic samples using the A1 and A2 copulas, which are designed to capture complex dependency structures, and compare their effectiveness against the widely used SMOTE technique.
+This repository contains the full dataset and implementation of a machine learning pipeline that addresses class imbalance in diabetes classification by leveraging copula-based data generation. We generate synthetic samples using the A2 copula, which is designed to capture complex dependency structures, and compare our method's effectiveness against the widely used SMOTE technique.
 
-Our classification framework uses multiple ML models (Random Forest, Gradient Boosting, XGBoost, Logistic Regression), and evaluates performance via accuracy, precision, recall, F1, AUC, confusion matrices, and McNemar’s test.
+Our classification framework uses multiple ML models (Random Forest, Gradient Boosting, XGBoost, Logistic Regression, MLP), and evaluates performance via accuracy, precision, recall, F1, AUC, confusion matrices, and McNemar’s test.
+
+
+## Pima Indians Diabetes Dataset  
+
+**Source:** [Kaggle – Pima Indians Diabetes Dataset](https://www.kaggle.com/datasets/gzdekzlkaya/pima-indians-diabetes-dataset/data)  
+**License:** [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)  
+**Note:** No modifications were made (except formatting for our experiments).
 
 
 ## 📦 Requirements
