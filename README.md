@@ -14,7 +14,7 @@ Our classification framework uses multiple ML models (Random Forest, Gradient Bo
 ## Pima Indians Diabetes Dataset  
 
 **Source:** [Kaggle – Pima Indians Diabetes Dataset](https://www.kaggle.com/datasets/gzdekzlkaya/pima-indians-diabetes-dataset/data)  
-**License:** [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)  
+**License:** [CC0: Public Domain](https://creativecommons.org/publicdomain/zero/1.0/)  
 **Note:** No modifications were made (except formatting for our experiments).
 
 
