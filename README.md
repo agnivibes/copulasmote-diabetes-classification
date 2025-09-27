@@ -4,7 +4,6 @@
 [![scikit-learn](https://img.shields.io/badge/ML-scikit--learn%20%7C%20XGBoost%20%7C%20LogReg-orange)](https://scikit-learn.org/stable/)
 [![Copulas](https://img.shields.io/badge/Dependency%20Modeling-Copulas-6f42c1)](https://en.wikipedia.org/wiki/Copula_(probability_theory))
 [![SMOTE](https://img.shields.io/badge/Oversampling-SMOTE-ff69b4)](https://imbalanced-learn.org/stable/references/generated/imblearn.over_sampling.SMOTE.html)
-[![Dataset](https://img.shields.io/badge/Data-PIMA%20Diabetes-yellowgreen)](https://www.kaggle.com/datasets/gzdekzlkaya/pima-indians-diabetes-dataset)
 
 This repository contains the full dataset and implementation of a machine learning pipeline that addresses class imbalance in diabetes classification by leveraging copula-based data generation. We generate synthetic samples using the A2 copula, which is designed to capture complex dependency structures, and compare our method's effectiveness against the widely used SMOTE technique.
 
@@ -29,7 +28,7 @@ pip install numpy pandas scikit-learn xgboost imbalanced-learn statsmodels
 ```bash
 git clone https://github.com/agnivibes/copulasmote-diabetes-classification.git
 cd copulasmote-diabetes-classification
-python main.py
+python copulasmote_diabetes.py
 ```
 
 ## 🔬 Research Paper
