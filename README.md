@@ -36,14 +36,14 @@ Aich, A., Murshed, Murshed, M., Hewage, S. and Mayeaux, A.(2025). CopulaSMOTE: A
 
 ## 📊 Citation
 If you use this code or method in your own work, please cite:
-
+```bibtext
 @article{Aich2025CopulaSMOTE,
   title   = {CopulaSMOTE: A Copula-Based Oversampling Approach for Imbalanced Classification in Diabetes Prediction},
   author  = {Aich, Agnideep, Murshed, Monzur Md., Hewage, Sameera and Mayeaux, Amanda},
   year    = {2025},
   note    = {Manuscript under review}
 }
-
+```
 ## 📬 Contact
 For questions or collaborations, feel free to contact:
 
