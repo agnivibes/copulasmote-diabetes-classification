@@ -27,7 +27,7 @@ git clone https://github.com/agnivibes/copulasmote-diabetes-classification.git
 cd copulasmote-diabetes-classification
 
 # Run on a chosen dataset: PIMA, IRAQI, or CDC
-python vine_experiment_unified_plus.py PIMA
+python copulasmote_diabetes.py PIMA
 ```
 
 Per-dataset results (metrics, statistical tests, and figures) are written to `./results_<dataset>/`.
