@@ -1,798 +1,923 @@
+"""
+Requirements
+------------
+    pip install numpy pandas scikit-learn xgboost imbalanced-learn
+    pip install pyvinecopulib nflows torch scipy statsmodels matplotlib seaborn
+"""
+
+#Set thread limits BEFORE any numpy/sklearn imports =
 import os
-import math
-import json
+os.environ["MKL_NUM_THREADS"]     = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"]     = "1"
+
+import sys
+import warnings
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+import torch
+from scipy import stats as sp_stats
 
-from typing import Tuple, Dict, List
-
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.linear_model import LogisticRegression
-from xgboost import XGBClassifier
-from sklearn.neural_network import MLPClassifier
-
-
+from sklearn.model_selection   import StratifiedKFold
+from sklearn.preprocessing     import StandardScaler
+from sklearn.impute             import SimpleImputer
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score,
-    f1_score, roc_auc_score, confusion_matrix, roc_curve
+    f1_score, roc_auc_score, average_precision_score,
+    balanced_accuracy_score, confusion_matrix,
+    roc_curve, precision_recall_curve,
 )
+from sklearn.base     import clone
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model  import LogisticRegression
+from sklearn.neural_network import MLPClassifier
+from xgboost import XGBClassifier
 
-from imblearn.over_sampling import SMOTE
-from scipy.optimize import brentq
-from statsmodels.stats.contingency_tables import mcnemar
-from sklearn.base import clone
-from numpy.random import RandomState
-from sklearn.metrics import precision_recall_curve, average_precision_score
+from imblearn.over_sampling import SMOTE, BorderlineSMOTE, ADASYN
+import pyvinecopulib as pv
 
-try:
-    import tensorflow as tf
-    from tensorflow import keras
-    HAS_TF = True
-except Exception:
-    HAS_TF = False
+from nflows.flows         import Flow
+from nflows.distributions import StandardNormal
+from nflows.transforms    import (
+    CompositeTransform, AffineCouplingTransform, RandomPermutation,
+)
+from nflows.nn.nets import ResidualNet
 
-from sklearn.base import BaseEstimator, ClassifierMixin
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-# ──────────────────────────────────────────────────────────────────────────────
-# User settings
-# ──────────────────────────────────────────────────────────────────────────────
+warnings.filterwarnings("ignore")
 
-# <<< SET THIS TO YOUR DATA FILE >>>
-DATA_CSV = r"C:\\Users\\User\\Downloads\\pima_diabetes_data.csv" # change me
+os.chdir(r"G:\My Drive\CopulaSMOTE_5_17")
 
-# Where to save outputs
-OUT_DIR = os.path.join(os.path.dirname(__file__) or ".", "outputs")
-os.makedirs(OUT_DIR, exist_ok=True)
 
-# Reproducibility
+# CONFIGURATION
+
 SEED = 42
-rng = RandomState(SEED)
+np.random.seed(SEED)          # global numpy seed for reproducibility
 
-FEATURE_1, FEATURE_2 = "Glucose", "BMI"   # top-2 features selected in paper
-THETAS = [2, 5, 10]                        # dependence settings for A2 plots/ROCs
-N_SYNTH_PER_TRAIN = None                   # if None, auto-balance to 1:1 using train split counts
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Math helpers: A2 copula generator, derivative, and inverse
-# ──────────────────────────────────────────────────────────────────────────────
-
-def phi_A2(t: np.ndarray, theta: float) -> np.ndarray:
-    """
-    A2 generator: φ(t) = [ ((1 - t)^2) / t ]^θ, defined for t in (0, 1].
-    At t→1, φ(1) = 0. At t→0+, φ → ∞.
-    """
-    t = np.asarray(t, dtype=float)
-    # Guard rails for numerical stability
-    eps = 1e-12
-    t = np.clip(t, eps, 1.0)  # avoid division by zero
-    g = ((1.0 - t) ** 2) / t
-    return np.power(g, theta)
-
-
-def dphi_A2(t: np.ndarray, theta: float) -> np.ndarray:
-    """
-    Derivative φ'(t) for A2.
-    Let g(t) = ((1 - t)^2)/t; then φ(t) = g(t)^θ.
-    g'(t) = -(1 - t)*(1 + t)/t^2.
-    So φ'(t) = θ * g(t)^(θ - 1) * g'(t).
-    """
-    t = np.asarray(t, dtype=float)
-    eps = 1e-12
-    t = np.clip(t, eps, 1.0)
-    g = ((1.0 - t) ** 2) / t
-    gprime = - (1.0 - t) * (1.0 + t) / (t ** 2)
-    return theta * np.power(g, theta - 1.0) * gprime
+CONFIGS = {
+    "PIMA": {
+        "path"        : "pima.csv",
+        "target"      : "Outcome",
+        "sample_size" : None,
+        "zero_na_cols": ["Glucose", "BloodPressure", "SkinThickness",
+                         "Insulin", "BMI"],
+    },
+    "IRAQI": {
+        "path"        : "Diabetes_aravind.csv",
+        "target"      : "CLASS",
+        "sample_size" : None,
+        "zero_na_cols": [],
+    },
+    "CDC": {
+        "path"        : "diabetes_binary_health_indicators_BRFSS2015.csv",
+        "target"      : "Diabetes_binary",
+        "sample_size" : None,   # set e.g. 50000 for quick debugging
+        "zero_na_cols": [],
+    },
+}
 
 
-def phi_A2_inv(y: np.ndarray, theta: float) -> np.ndarray:
-    """
-    Inverse generator for A2:
-    φ^{-1}(y) = [ s + 2 - sqrt((s + 2)^2 - 4) ] / 2, where s = y^{1/θ}.
-    Maps y in [0, ∞) to t in (0, 1].
-    """
-    y = np.asarray(y, dtype=float)
-    s = np.power(np.maximum(y, 0.0), 1.0 / theta)
-    a = 2.0 + s
-    # Guard against tiny negative roundoff under the sqrt
-    inner = np.maximum(a * a - 4.0, 0.0)
-    t = (a - np.sqrt(inner)) / 2.0
-    # Clip into (0,1]
-    return np.clip(t, 1e-12, 1.0)
+METHOD_ORDER = [
+    "SMOTE",
+    "BorderlineSMOTE",
+    "ADASYN",
+    "Flow",
+    "CopulaSMOTE",
+]
 
+METHOD_COLORS = {
+    "SMOTE"          : "#1f77b4",
+    "BorderlineSMOTE": "#9467bd",
+    "ADASYN"         : "#8c564b",
+    "Flow"           : "#ff7f0e",
+    "CopulaSMOTE"           : "#2ca02c",
+}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Genest–Rivest sampler utilities (Archimedean copula)
-# ──────────────────────────────────────────────────────────────────────────────
+# Common grids for curve averaging
+MEAN_FPR = np.linspace(0, 1, 200)
+MEAN_REC = np.linspace(0, 1, 200)[::-1]
 
-def K_fun(x: float, theta: float) -> float:
-    """K(x) = x - φ(x)/φ'(x)."""
-    val = dphi_A2(x, theta)
-    # add tiny epsilon only in code for safety (not in paper formula)
-    return x - (phi_A2(x, theta) / (val + 1e-15))
+# Paper-quality plot constants 
+PAPER_FONT       = 11
+PAPER_TITLE_FONT = 13
+PAPER_DPI        = 300
+PAPER_LINEWIDTH  = 1.8
+PAPER_ALPHA      = 0.15
 
+# DATASET LOADING & CLEANING
 
-def K_inv(tval: float, theta: float) -> float:
-    """Find w in (0,1) such that K(w) = tval via brentq."""
-    a, b = 1e-9, 1.0 - 1e-9
-    # Ensure monotone bracket by checking values
-    Ka = K_fun(a, theta) - tval
-    Kb = K_fun(b, theta) - tval
-    # If signs aren't opposite due to numeric noise, nudge bounds
-    if Ka * Kb > 0:
-        # fallback small expansion around tval by scanning grid
-        xs = np.linspace(1e-6, 1.0 - 1e-6, 1000)
-        vals = [K_fun(x, theta) - tval for x in xs]
-        sign_changes = np.where(np.sign(vals[:-1]) * np.sign(vals[1:]) < 0)[0]
-        if len(sign_changes) == 0:
-            # As a last resort, return midpoint (very rare); downstream will clip
-            return 0.5
-        i = sign_changes[0]
-        a, b = xs[i], xs[i + 1]
-    return brentq(lambda x: K_fun(x, theta) - tval, a, b, xtol=1e-9, rtol=1e-9, maxiter=100)
+def load_dataset(name: str) -> tuple:
+    """Return (X: pd.DataFrame, y: np.ndarray, feature_names: list)."""
+    cfg    = CONFIGS[name]
+    target = cfg["target"]
 
-
-def sample_copula_A2(theta: float, n: int, seed: int = SEED) -> Tuple[np.ndarray, np.ndarray]:
-    """Genest–Rivest sampling for A2 copula. Returns U,V in (0,1]."""
-    rs = RandomState(seed)
-    s = rs.rand(n)
-    t = rs.rand(n)
-    U = np.empty(n, dtype=float)
-    V = np.empty(n, dtype=float)
-    for i in range(n):
-        w = K_inv(t[i], theta)
-        phiw = phi_A2(w, theta)
-        if phiw < 1e-15:
-            U[i] = 1.0
-            V[i] = 1.0
+    # Read CSV (Iraqi file may use \r line endings)  
+    if name == "IRAQI":
+        with open(cfg["path"], "rb") as f:
+            sample = f.read(10_000)
+        if b"\r" in sample and b"\n" not in sample:
+            df = pd.read_csv(cfg["path"], lineterminator="\r")
         else:
-            U[i] = phi_A2_inv(s[i] * phiw, theta)
-            V[i] = phi_A2_inv((1.0 - s[i]) * phiw, theta)
-    return U, V
+            df = pd.read_csv(cfg["path"])
+    else:
+        df = pd.read_csv(cfg["path"])
+
+    #  Iraqi-specific cleaning  
+    if name == "IRAQI":
+        df = df.drop(columns=["ID", "No_Pation"], errors="ignore")
+
+        df[target] = df[target].astype(str).str.strip().str.upper()
+
+        n_P = (df[target] == "P").sum()
+        if n_P > 0:
+            print(f"  [Iraqi] Dropping {n_P} pre-diabetic 'P' samples")
+        df = df[df[target].isin(["N", "Y"])].copy()
+        df[target] = df[target].map({"N": 0, "Y": 1}).astype(int)
+
+        if "Gender" in df.columns:
+            df["Gender"] = (
+                df["Gender"].astype(str).str.strip().str.upper()
+                .map({"F": 0, "M": 1})
+            )
+
+        feat_cols = [c for c in df.columns if c != target]
+        for col in feat_cols:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna().reset_index(drop=True)
+
+    # Optional sub-sampling 
+    if cfg["sample_size"] and len(df) > cfg["sample_size"]:
+        df = df.sample(n=cfg["sample_size"], random_state=SEED).reset_index(drop=True)
+
+    # Zero-coded missing values (PIMA) 
+    for col in cfg["zero_na_cols"]:
+        if col in df.columns:
+            df[col] = df[col].replace(0, np.nan)
+
+    X = df.drop(columns=target)
+    y = df[target].astype(int).values
+    return X, y, list(X.columns)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# ECDF inverse (minority-class marginals)
-# ──────────────────────────────────────────────────────────────────────────────
+# VINE COPULA
 
-def inverse_ecdf(orig: np.ndarray, u: np.ndarray) -> np.ndarray:
+
+def ecdf_transform(X: np.ndarray) -> np.ndarray:
+    """Weibull plotting-position pseudo-observations."""
+    n, d = X.shape
+    U = np.zeros_like(X, dtype=float)
+    for j in range(d):
+        ranks      = np.argsort(np.argsort(X[:, j])) + 1
+        U[:, j]    = ranks / (n + 1)
+    return U
+
+
+def inverse_ecdf(ref_df: pd.DataFrame, U: np.ndarray) -> pd.DataFrame:
+    """Nearest-neighbour inverse ECDF (quantile mapping).
+
+    Note: U values near 1.0 are clipped to index n-1, which means the
+    upper tail is slightly underrepresented. This is expected behaviour
+    for empirical quantile inversion and is negligible in practice.
     """
-    Map u in (0,1] to sample quantiles of 'orig' via empirical CDF inverse.
-    Uses ceil(u*(N)) - 1 indexing, clipped to [0, N-1].
-    """
-    vals = np.sort(np.asarray(orig, dtype=float))
-    N = len(vals)
-    # rank index: ceil(u * N) - 1; but since U in (0,1], clip robustly
-    idx = np.ceil(np.asarray(u) * (N + 1)).astype(int) - 1
-    idx = np.clip(idx, 0, N - 1)
-    return vals[idx]
+    X_syn = np.zeros_like(U, dtype=float)
+    for j, col in enumerate(ref_df.columns):
+        vals      = np.sort(ref_df[col].values.astype(float))
+        n         = len(vals)
+        idx       = np.clip((U[:, j] * n).astype(int), 0, n - 1)
+        X_syn[:, j] = vals[idx]
+    return pd.DataFrame(X_syn, columns=ref_df.columns)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Synthetic minority generator from A2 copula (two-feature dependence)
-# ──────────────────────────────────────────────────────────────────────────────
+def fit_vine(df: pd.DataFrame, seed: int) -> pv.Vinecop:
+    rng = np.random.RandomState(seed)
+    X   = df.values.astype(float)
 
-def gen_from_copula_A2(minority_train_df: pd.DataFrame,
-                       theta: float,
-                       n_synth: int,
-                       feature_1: str = FEATURE_1,
-                       feature_2: str = FEATURE_2,
-                       seed: int = SEED) -> pd.DataFrame:
-    """
-    Generate n_synth synthetic minority rows using A2 copula on (feature_1, feature_2) of minority TRAIN data.
-    For the remaining features, bootstrap-with-replacement rows from the minority TRAIN set.
-    """
-    rs = RandomState(seed)
-    U, V = sample_copula_A2(theta=theta, n=n_synth, seed=seed)
+    # Continuous extension: tiny jitter for tied / discrete values
+    X += 1e-6 * rng.randn(*X.shape)
+    U  = ecdf_transform(X)
 
-    g1 = inverse_ecdf(minority_train_df[feature_1].values, U)
-    g2 = inverse_ecdf(minority_train_df[feature_2].values, V)
+    controls = pv.FitControlsVinecop(
+        family_set=[
+            pv.BicopFamily.indep,
+            pv.BicopFamily.gaussian,
+            pv.BicopFamily.student,
+            pv.BicopFamily.clayton,
+            pv.BicopFamily.gumbel,
+            pv.BicopFamily.frank,
+        ],
+        trunc_lvl=min(3, max(1, df.shape[1] - 1)),
+        selection_criterion="bic",
+        allow_rotations=True,
+    )
+    return pv.Vinecop.from_data(U, controls=controls)
 
-    other_cols = [c for c in minority_train_df.columns if c not in (feature_1, feature_2)]
-    other = minority_train_df[other_cols].sample(n_synth, replace=True, random_state=seed).reset_index(drop=True)
 
-    out = other.copy()
-    out[feature_1] = g1
-    out[feature_2] = g2
-    out["Outcome"] = 1
-    return out
+def gen_vine(minority_df: pd.DataFrame, n_synth: int, seed: int) -> pd.DataFrame:
+    if n_synth <= 0:
+        return minority_df.iloc[0:0].copy()
+    vine = fit_vine(minority_df, seed)
+    U    = vine.simulate(n_synth, seeds=[seed])
+    U    = np.clip(U, 1e-6, 1 - 1e-6)
+    return inverse_ecdf(minority_df, U)
 
-class KerasMLPClassifier(BaseEstimator, ClassifierMixin):
-    def __init__(self,
-                 hidden_layers=(64, 32),
-                 dropout=0.2,
-                 l2=1e-4,
-                 learning_rate=1e-3,
-                 batch_size=32,
-                 epochs=200,
-                 patience=20,
-                 random_state=42,
-                 verbose=0):
-        self.hidden_layers = hidden_layers
-        self.dropout = dropout
-        self.l2 = l2
-        self.learning_rate = learning_rate
-        self.batch_size = batch_size
-        self.epochs = epochs
-        self.patience = patience
-        self.random_state = random_state
-        self.verbose = verbose
-        self._model = None
-        self._input_dim = None
 
-    def _build_model(self, input_dim):
-        reg = keras.regularizers.l2(self.l2) if self.l2 else None
-        model = keras.Sequential()
-        for i, h in enumerate(self.hidden_layers):
-            if i == 0:
-                model.add(keras.layers.Dense(h, activation='relu',
-                                             kernel_regularizer=reg, input_shape=(input_dim,)))
-            else:
-                model.add(keras.layers.Dense(h, activation='relu', kernel_regularizer=reg))
-            if self.dropout and self.dropout > 0:
-                model.add(keras.layers.Dropout(self.dropout))
-        model.add(keras.layers.Dense(1, activation='sigmoid'))
-        opt = keras.optimizers.Adam(learning_rate=self.learning_rate)
-        model.compile(optimizer=opt, loss='binary_crossentropy',
-                      metrics=[keras.metrics.AUC(name='AUC'),
-                               keras.metrics.AUC(curve='PR', name='AUC_PR')])
-        return model
 
-    def fit(self, X, y):
-        if not HAS_TF:
-            raise RuntimeError("TensorFlow/Keras not available. Install tensorflow to use KerasMLPClassifier.")
-        np.random.seed(self.random_state)
-        tf.random.set_seed(self.random_state)
+# NORMALIZING FLOW
 
-        self._input_dim = X.shape[1]
-        self._model = self._build_model(self._input_dim)
-        es = keras.callbacks.EarlyStopping(monitor='val_loss', patience=self.patience,
-                                           restore_best_weights=True, verbose=self.verbose)
-        self._model.fit(X, y,
-                        validation_split=0.2,
-                        epochs=self.epochs,
-                        batch_size=self.batch_size,
-                        verbose=self.verbose,
-                        callbacks=[es])
-        return self
 
-    def predict_proba(self, X):
-        p = self._model.predict(X, verbose=0).reshape(-1)
-        return np.vstack([1.0 - p, p]).T
+def build_flow(d: int) -> Flow:
+    transforms = []
+    for _ in range(4):
+        transforms.append(RandomPermutation(features=d))
+        transforms.append(
+            AffineCouplingTransform(
+                mask=torch.tensor(np.arange(d) % 2, dtype=torch.uint8),
+                transform_net_create_fn=lambda in_f, out_f: ResidualNet(
+                    in_features=in_f,
+                    out_features=out_f,
+                    hidden_features=32,
+                    num_blocks=2,
+                ),
+            )
+        )
+    return Flow(CompositeTransform(transforms), StandardNormal([d]))
 
-    def predict(self, X):
-        p = self._model.predict(X, verbose=0).reshape(-1)
-        return (p >= 0.5).astype(int)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Models & evaluation
-# ──────────────────────────────────────────────────────────────────────────────
+def train_flow(
+    X_train: np.ndarray,
+    seed: int,
+    epochs: int = 200,
+    lr: float = 1e-3,
+) -> Flow:
+    torch.manual_seed(seed)
+    flow  = build_flow(X_train.shape[1])
+    optim = torch.optim.Adam(flow.parameters(), lr=lr)
+    X_t   = torch.tensor(X_train, dtype=torch.float32)
 
-def get_models() -> Dict[str, object]:
+    flow.train()
+    for epoch in range(epochs):
+        optim.zero_grad()
+        loss = -flow.log_prob(X_t).mean()
+        loss.backward()
+        optim.step()
+        if (epoch + 1) % 50 == 0:
+            print(f"    [Flow] epoch {epoch+1}/{epochs}  loss={loss.item():.4f}")
+
+    return flow
+
+
+def gen_flow(
+    flow: Flow, n_synth: int, columns: list, seed: int
+) -> pd.DataFrame:
+    torch.manual_seed(seed)
+    flow.eval()
+    with torch.no_grad():
+        samples = flow.sample(n_synth).numpy()
+    return pd.DataFrame(samples, columns=columns)
+
+
+# CLASSIFIERS
+
+def get_models(seed: int) -> dict:
+    """Default-hyperparameter classifiers."""
     return {
-        "RF": RandomForestClassifier(random_state=SEED),
-        "GB": GradientBoostingClassifier(random_state=SEED),
-        "XGB": XGBClassifier(eval_metric="logloss", random_state=SEED),
-        "LR": LogisticRegression(max_iter=1000, random_state=SEED),
-        # Deep-learning baseline (MLP)
-        "MLP": MLPClassifier(
-            hidden_layer_sizes=(64, 32),
-            activation="relu",
-            alpha=1e-4,
-            batch_size=32,
-            learning_rate_init=1e-3,
-            max_iter=200,
-            early_stopping=True,
-            n_iter_no_change=10,
-            validation_fraction=0.1,
-            random_state=SEED,
-        ),
+        "RF" : RandomForestClassifier(random_state=seed),
+        "GB" : GradientBoostingClassifier(random_state=seed),
+        "XGB": XGBClassifier(eval_metric="logloss", random_state=seed),
+        "LR" : LogisticRegression(max_iter=1000),
+        "MLP": MLPClassifier(random_state=seed),
     }
 
 
 
-def evaluate_models(models: Dict[str, object],
-                    X_tr: np.ndarray, y_tr: np.ndarray,
-                    X_te: np.ndarray, y_te: np.ndarray) -> pd.DataFrame:
-    rows = []
-    for name, model in models.items():
-        m = clone(model)
-        m.fit(X_tr, y_tr)
-        pred = m.predict(X_te)
-        if hasattr(m, "predict_proba"):
-            proba = m.predict_proba(X_te)[:, 1]
-        else:
-            # For models without proba, fall back to labels for AUC (not ideal); all chosen models have proba
-            proba = pred.astype(float)
-        rows.append({
-            "Model": name,
-            "Acc": accuracy_score(y_te, pred),
-            "Prec": precision_score(y_te, pred),
-            "Rec": recall_score(y_te, pred),
-            "F1": f1_score(y_te, pred),
-            "AUC": roc_auc_score(y_te, proba)
-        })
-    return pd.DataFrame(rows).set_index("Model")
+# PLOTTING HELPERS  
 
+def plot_roc_curves_averaged(roc_store: dict, out_path: str, dataset: str):
+    """2-column grid of mean ROC ± 1-std band curves, paper-ready."""
+    models = sorted({k[1] for k in roc_store})
+    n_cols = 2
+    n_rows = (len(models) + 1) // n_cols
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Plots
-# ──────────────────────────────────────────────────────────────────────────────
-
-def plot_confusion_matrices(smote_models: Dict[str, object],
-                            a2_models: Dict[str, object],
-                            X_te_sm: np.ndarray, y_te: np.ndarray,
-                            X_te_a2: np.ndarray,
-                            title_suffix: str,
-                            out_path: str) -> None:
-    """
-    Two rows × N models: top row SMOTE (Blues), bottom row A2 (Oranges).
-    Each model's pair shares the same color scale for fair visual comparison.
-    """
-    model_names = list(a2_models.keys())  # order from your dict
-    n = len(model_names)
-
-    fig, axes = plt.subplots(2, n, figsize=(4.5 * n, 9))
-    if n == 1:
-        axes = np.array([[axes[0]], [axes[1]]])
-
-    for i, name in enumerate(model_names):
-        # Predictions
-        yhat_sm = smote_models[name].predict(X_te_sm)
-        yhat_a2 = a2_models[name].predict(X_te_a2)
-
-        # Confusion matrices
-        cm_sm = confusion_matrix(y_te, yhat_sm)
-        cm_a2 = confusion_matrix(y_te, yhat_a2)
-
-        # Share color scale within the pair
-        vmax_pair = max(cm_sm.max(), cm_a2.max())
-
-        # --- Top row: SMOTE (Blues) ---
-        ax_top = axes[0, i]
-        im_top = ax_top.imshow(cm_sm, interpolation="nearest", cmap="Blues",
-                               vmin=0, vmax=vmax_pair)
-        ax_top.set_xticks([0, 1]);
-        ax_top.set_yticks([0, 1])
-        ax_top.set_xticklabels(["0", "1"]);
-        ax_top.set_yticklabels(["0", "1"])
-        ax_top.set_title(f"{name} (SMOTE)")
-        ax_top.set_xlabel("Predicted"); ax_top.set_ylabel("True")
-        for (r, c), v in np.ndenumerate(cm_sm):
-            ax_top.text(c, r, str(v), ha="center", va="center")
-        fig.colorbar(im_top, ax=ax_top, fraction=0.046, pad=0.04)
-
-        # --- Bottom row: A2 (Oranges) ---
-        ax_bot = axes[1, i]
-        im_bot = ax_bot.imshow(cm_a2, interpolation="nearest", cmap="Oranges",
-                               vmin=0, vmax=vmax_pair)
-        ax_bot.set_xticks([0, 1]);
-        ax_bot.set_yticks([0, 1])
-        ax_bot.set_xticklabels(["0", "1"]);
-        ax_bot.set_yticklabels(["0", "1"])
-        ax_bot.set_title(f"{name} (A2 {title_suffix})")
-        ax_bot.set_xlabel("Predicted"); ax_bot.set_ylabel("True")
-        for (r, c), v in np.ndenumerate(cm_a2):
-            ax_bot.text(c, r, str(v), ha="center", va="center")
-        fig.colorbar(im_bot, ax=ax_bot, fraction=0.046, pad=0.04)
-
-    plt.tight_layout()
-    plt.savefig(out_path, bbox_inches="tight")
-    plt.close(fig)
-
-
-
-
-
-def plot_roc_curves(SM: Tuple[np.ndarray, np.ndarray, np.ndarray],
-                    A2_by_theta: Dict[int, Tuple[np.ndarray, np.ndarray, np.ndarray]],
-                    models: Dict[str, object],
-                    out_path: str) -> None:
-    """
-    For each model, draw SMOTE ROC and A2 ROC for θ in THETAS.
-    Inputs:
-      SM: ((X_tr_sm, y_tr_sm), X_te_sm, y_te)
-      A2_by_theta: {theta: (X_tr_a2, y_tr_a2, X_te_a2)}
-    """
-    (X_tr_sm, y_tr_sm), X_te_sm, y_te = SM
-    model_names = list(models.keys())
-    n = len(model_names)
-    rows = math.ceil(n / 2)
-    cols = 2
-
-    fig, axes = plt.subplots(rows, cols, figsize=(12, 4.5 * rows))
-    axes = np.array(axes).ravel()
-
-    for i, name in enumerate(model_names):
-        ax = axes[i]
-
-        # Fit SMOTE model and ROC
-        m_sm = clone(models[name])
-        m_sm.fit(X_tr_sm, y_tr_sm)
-        proba_sm = m_sm.predict_proba(X_te_sm)[:, 1]
-        fpr_sm, tpr_sm, _ = roc_curve(y_te, proba_sm)
-        auc_sm = roc_auc_score(y_te, proba_sm)
-        ax.plot(fpr_sm, tpr_sm, label=f"SMOTE (AUC={auc_sm:.3f})", lw=2)
-
-        # For each theta
-        for theta, (X_tr_a2, y_tr_a2, X_te_a2) in A2_by_theta.items():
-            m = clone(models[name])
-            m.fit(X_tr_a2, y_tr_a2)
-            proba = m.predict_proba(X_te_a2)[:, 1]
-            fpr, tpr, _ = roc_curve(y_te, proba)
-            auc = roc_auc_score(y_te, proba)
-            ax.plot(fpr, tpr, lw=2, label=f"A2 θ={theta} (AUC={auc:.3f})")
-
-        ax.plot([0, 1], [0, 1], "k--", lw=1)
-        ax.set_title(name)
-        ax.set_xlabel("False Positive Rate")
-        ax.set_ylabel("True Positive Rate")
-        ax.legend(loc="lower right")
-        ax.grid(True)
-
-    # Hide unused axes if any
-    for j in range(i + 1, rows * cols):
-        fig.delaxes(axes[j])
-
-    plt.tight_layout()
-    plt.savefig(out_path, bbox_inches="tight")
-    plt.close(fig)
-
-
-
-def plot_pr_curves(SM: Tuple[np.ndarray, np.ndarray, np.ndarray],
-                   A2_by_theta: Dict[int, Tuple[np.ndarray, np.ndarray, np.ndarray]],
-                   models: Dict[str, object],
-                   out_path: str) -> None:
-    """
-    For each model, draw SMOTE PR curve and A2 PR curves for θ in THETAS.
-    Inputs:
-      SM: ((X_train_sm, y_train_sm), X_test_sm, y_test)
-      A2_by_theta: {theta: (X_train_a2, y_train_a2, X_test_a2)}
-    """
-    (X_tr_sm, y_tr_sm), X_te_sm, y_te = SM
-    model_names = list(models.keys())
-    n = len(model_names)
-    rows = math.ceil(n / 2)
-    cols = 2
-
-    fig, axes = plt.subplots(rows, cols, figsize=(12, 4.5 * rows))
-    axes = np.array(axes).ravel()
-
-    for i, name in enumerate(model_names):
-        ax = axes[i]
-
-        # SMOTE
-        m_sm = clone(models[name])
-        m_sm.fit(X_tr_sm, y_tr_sm)
-        proba_sm = m_sm.predict_proba(X_te_sm)[:, 1]
-        pr_sm, rc_sm, _ = precision_recall_curve(y_te, proba_sm)
-        ap_sm = average_precision_score(y_te, proba_sm)
-        ax.plot(rc_sm, pr_sm, lw=2, label=f"SMOTE (AP={ap_sm:.3f})")
-
-        # A2 for each theta
-        for theta, (X_tr_a2, y_tr_a2, X_te_a2) in A2_by_theta.items():
-            m = clone(models[name])
-            m.fit(X_tr_a2, y_tr_a2)
-            proba = m.predict_proba(X_te_a2)[:, 1]
-            pr, rc, _ = precision_recall_curve(y_te, proba)
-            ap = average_precision_score(y_te, proba)
-            ax.plot(rc, pr, lw=2, label=f"A2 θ={theta} (AP={ap:.3f})")
-
-        ax.set_xlim(0, 1); ax.set_ylim(0, 1)
-        ax.set_title(name)
-        ax.set_xlabel("Recall")
-        ax.set_ylabel("Precision")
-        ax.legend(loc="lower left")
-        ax.grid(True)
-
-    # Hide unused axes if any
-    for j in range(i + 1, rows * cols):
-        fig.delaxes(axes[j])
-
-    plt.tight_layout()
-    plt.savefig(out_path, bbox_inches="tight")
-    plt.close(fig)
-
-
-
-def plot_mcnemar_contingency(table: np.ndarray, chi2: float, p: float, out_path: str) -> None:
-    """
-    Plots the 2x2 McNemar contingency as a heatmap with labels:
-      [[n11 (both correct), n10 (SMOTE only correct)],
-       [n01 (A2 only correct), n00 (both incorrect)]]
-    """
-    fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(table, cmap="Blues", vmin=0)
-
-    ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
-    ax.set_xticklabels(["A2 correct", "A2 incorrect"], rotation=20)
-    ax.set_yticklabels(["SMOTE correct", "SMOTE incorrect"])
-
-    for (r, c), v in np.ndenumerate(table):
-        ax.text(c, r, str(v), ha="center", va="center", fontsize=12, fontweight="bold")
-
-    ax.set_title(f"McNemar Contingency (χ²={chi2:.3f}, p={p:.3g})")
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    plt.tight_layout()
-    plt.savefig(out_path, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_copula_samples_and_overlays(minority_df: pd.DataFrame,
-                                     thetas: List[int],
-                                     feature_1: str, feature_2: str,
-                                     n_samples: int,
-                                     out_path: str) -> None:
-    fig, axes = plt.subplots(2, len(thetas), figsize=(5.5 * len(thetas), 10))
-    original_f1 = minority_df[feature_1].values
-    original_f2 = minority_df[feature_2].values
-
-    for i, theta in enumerate(thetas):
-        U, V = sample_copula_A2(theta=theta, n=n_samples, seed=SEED + i)
-        # row 1: U vs V
-        axes[0, i].scatter(U, V, alpha=0.5, s=10)
-        axes[0, i].set_title(f"A2 Copula Samples (θ={theta})")
-        axes[0, i].set_xlabel("U")
-        axes[0, i].set_ylabel("V")
-        axes[0, i].set_xlim(0, 1)
-        axes[0, i].set_ylim(0, 1)
-        axes[0, i].grid(True)
-
-        # row 2: overlay in feature space
-        g1 = inverse_ecdf(original_f1, U)
-        g2 = inverse_ecdf(original_f2, V)
-        axes[1, i].scatter(original_f1, original_f2, alpha=0.35, s=20, label="Original")
-        axes[1, i].scatter(g1, g2, alpha=0.55, s=20, label="Synthetic")
-        axes[1, i].set_title(f"Original vs Synthetic (θ={theta})")
-        axes[1, i].set_xlabel(feature_1)
-        axes[1, i].set_ylabel(feature_2)
-        axes[1, i].grid(True)
-        if i == 0:
-            axes[1, i].legend()
-
-    plt.tight_layout()
-    plt.savefig(out_path, bbox_inches="tight")
-    plt.close(fig)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Quick unit checks to catch math/code drift
-# ──────────────────────────────────────────────────────────────────────────────
-
-def sanity_checks_A2():
-    # avoid the most extreme endpoint; it only stresses floating-point, not math
-    tgrid = np.linspace(1e-5, 1 - 1e-9, 2000)
-    for theta in THETAS:
-        # φ should be non-increasing and ~0 at t=1
-        phi_vals = phi_A2(tgrid, theta)
-        assert np.all(np.diff(phi_vals) <= 1e-12), "phi_A2 should be non-increasing on (0,1]."
-        assert abs(phi_A2(1.0, theta)) < 1e-12, "phi_A2(1) should be ~0."
-
-        # Well-conditioned roundtrip: t -> φ(t) -> φ^{-1}(.) ≈ t
-        t_back = phi_A2_inv(phi_vals, theta)
-        assert np.allclose(tgrid, t_back, rtol=1e-6, atol=1e-9), "phi_inv(phi(t)) mismatch."
-
-        # Harder roundtrip: y -> φ^{-1}(y) -> φ(.) ≈ y (use a subsample & looser rtol)
-        ys = phi_vals[::400]  # pick a few across the range, avoid extremes
-        y_back = phi_A2(phi_A2_inv(ys, theta), theta)
-        assert np.allclose(ys, y_back, rtol=1e-4, atol=1e-8), "phi(phi_inv(y)) mismatch."
-
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Main pipeline
-# ──────────────────────────────────────────────────────────────────────────────
-
-def main():
-    sanity_checks_A2()
-
-    # 1) Load
-    df = pd.read_csv(DATA_CSV)
-    assert "Outcome" in df.columns, "CSV must contain 'Outcome' column."
-    X = df.drop(columns="Outcome")
-    y = df["Outcome"].astype(int).values
-
-    # 2) ONE split for everything
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=0.30, stratify=y, random_state=SEED
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(7 * n_cols, 5.5 * n_rows),
+        squeeze=False,
     )
-    # Use NumPy consistently for scalers (avoids feature-name warnings)
-    X_tr_np = X_tr.to_numpy()
-    X_te_np = X_te.to_numpy()
+    axes_flat = axes.flatten()
 
-    # Keep around convenience DFs
-    train_df = X_tr.copy()
-    train_df["Outcome"] = y_tr
-    test_df = X_te.copy()
-    test_df["Outcome"] = y_te
+    for i, model in enumerate(models):
+        ax = axes_flat[i]
+        for method in METHOD_ORDER:
+            key = (method, model)
+            if key not in roc_store or not roc_store[key]:
+                continue
 
-    # 3) Build SMOTE train (on TRAIN ONLY)
-    # --- SMOTE path ---
-    scaler_sm = StandardScaler().fit(X_tr_np)
-    X_tr_sm_scaled = scaler_sm.transform(X_tr_np)
-    X_te_sm_scaled = scaler_sm.transform(X_te_np)
-    X_tr_res_scaled, y_tr_res = SMOTE(random_state=SEED).fit_resample(X_tr_sm_scaled, y_tr)
+            interp_tprs, aucs = [], []
+            for fpr, tpr, auc_val in roc_store[key]:
+                interp_tpr    = np.interp(MEAN_FPR, fpr, tpr)
+                interp_tpr[0] = 0.0
+                interp_tprs.append(interp_tpr)
+                aucs.append(auc_val)
 
-    # 4) Build A2-augmented train (on TRAIN ONLY)
-    # Minority/majority counts on TRAIN
-    train_min = train_df[train_df["Outcome"] == 1].drop(columns="Outcome").reset_index(drop=True)
-    train_maj = train_df[train_df["Outcome"] == 0].drop(columns="Outcome").reset_index(drop=True)
+            mean_tpr      = np.mean(interp_tprs, axis=0)
+            mean_tpr[-1]  = 1.0
+            std_tpr       = np.std(interp_tprs, axis=0)
+            mean_auc      = np.mean(aucs)
+            std_auc       = np.std(aucs)
 
-    n_min = len(train_min)
-    n_maj = len(train_maj)
-    n_synth = (n_maj - n_min) if N_SYNTH_PER_TRAIN is None else int(N_SYNTH_PER_TRAIN)
-    if n_synth < 0:
-        n_synth = 0  # already balanced or minority larger (unlikely here)
+            color = METHOD_COLORS[method]
+            ax.plot(
+                MEAN_FPR, mean_tpr, color=color, lw=PAPER_LINEWIDTH,
+                label=f"{method}  ({mean_auc:.3f}±{std_auc:.3f})",
+            )
+            ax.fill_between(
+                MEAN_FPR,
+                np.clip(mean_tpr - std_tpr, 0, 1),
+                np.clip(mean_tpr + std_tpr, 0, 1),
+                color=color, alpha=PAPER_ALPHA,
+            )
 
-    # We'll train/evaluate at θ=2,5,10 for ROC, but θ=10 for confusion matrices (paper default)
-    # Prepare dicts storing scaled train/test per theta
-    A2_scaled_by_theta: Dict[int, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        ax.plot([0, 1], [0, 1], "k--", alpha=0.35, lw=1)
+        ax.set_title(model, fontsize=PAPER_TITLE_FONT, fontweight="bold")
+        ax.set_xlabel("False Positive Rate", fontsize=PAPER_FONT)
+        ax.set_ylabel("True Positive Rate",  fontsize=PAPER_FONT)
+        ax.tick_params(labelsize=PAPER_FONT - 1)
+        ax.legend(fontsize=PAPER_FONT - 2, loc="lower right",
+                  framealpha=0.9, edgecolor="grey")
 
-    # We'll save SMOTE models once and A2 models per-theta
-    models_smote = {}
-    models_a2_by_theta = {}  # dict[int -> dict[str->fitted model]]
+    for j in range(len(models), len(axes_flat)):
+        axes_flat[j].set_visible(False)
 
-    models_dict = get_models()
-
-    # For ROC plot, we need SMOTE (packed as ((X_train, y_train), X_test, y_test))
-    SM_for_roc = ((X_tr_res_scaled, y_tr_res), X_te_sm_scaled, y_te)
-
-    # Loop over thetas for A2 prep
-    for theta in THETAS:
-        if n_synth > 0:
-            synth = gen_from_copula_A2(train_min, theta=theta, n_synth=n_synth,
-                                       feature_1=FEATURE_1, feature_2=FEATURE_2, seed=SEED)
-            # Combine with ORIGINAL train set rows
-            a2_train_aug = pd.concat([train_df, synth], ignore_index=True)
-        else:
-            a2_train_aug = train_df.copy()
-
-        # --- A2 path (inside the theta loop) ---
-        Xa2_tr_raw = a2_train_aug.drop(columns="Outcome").to_numpy()
-        ya2_tr = a2_train_aug["Outcome"].astype(int).to_numpy()
-        scaler_a2 = StandardScaler().fit(Xa2_tr_raw)
-        Xa2_tr_scaled = scaler_a2.transform(Xa2_tr_raw)
-        Xa2_te_scaled = scaler_a2.transform(X_te_np)
-
-        # Store for ROC plotting
-        A2_scaled_by_theta[theta] = (Xa2_tr_scaled, ya2_tr, Xa2_te_scaled)
-
-        # Train/save models for THIS theta for confusion matrices & McNemar
-        models_a2_by_theta[theta] = {
-            name: clone(model).fit(Xa2_tr_scaled, ya2_tr)
-            for name, model in models_dict.items()
-        }
-
-    # Also train/save SMOTE models for confusion matrices & McNemar
-    for name, model in models_dict.items():
-        m = clone(model)
-        m.fit(X_tr_res_scaled, y_tr_res)
-        models_smote[name] = m
+    fig.suptitle(
+        f"{dataset} — Mean ROC Curves (5×2 CV, 10 folds)",
+        fontsize=PAPER_TITLE_FONT + 1, fontweight="bold",
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(out_path, dpi=PAPER_DPI, bbox_inches="tight")
+    plt.close(fig)
 
 
-    # 5) Metrics tables for every theta (A2 vs SMOTE) on SAME test set
-    sm_metrics = evaluate_models(models_smote, X_tr_res_scaled, y_tr_res, X_te_sm_scaled, y_te)
+def plot_pr_curves_averaged(pr_store: dict, out_path: str, dataset: str):
+    """2-column grid of mean PR ± 1-std band curves, paper-ready."""
+    models = sorted({k[1] for k in pr_store})
+    n_cols = 2
+    n_rows = (len(models) + 1) // n_cols
 
-    all_metrics = []
-    for theta in THETAS:
-        Xa2_tr_t, ya2_tr_t, Xa2_te_t = A2_scaled_by_theta[theta]
-        a2_metrics_t = evaluate_models(models_a2_by_theta[theta], Xa2_tr_t, ya2_tr_t, Xa2_te_t, y_te)
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(7 * n_cols, 5.5 * n_rows),
+        squeeze=False,
+    )
+    axes_flat = axes.flatten()
 
-        a2_metrics_t["Method"] = "A2"
-        a2_metrics_t["Theta"] = theta
-        sm_metrics_t = sm_metrics.copy()
-        sm_metrics_t["Method"] = "SMOTE"
-        sm_metrics_t["Theta"] = theta
+    for i, model in enumerate(models):
+        ax = axes_flat[i]
+        for method in METHOD_ORDER:
+            key = (method, model)
+            if key not in pr_store or not pr_store[key]:
+                continue
 
-        all_metrics.append(pd.concat([a2_metrics_t, sm_metrics_t]))
+            interp_precs, aps = [], []
+            for prec_arr, rec_arr, ap_val in pr_store[key]:
+                interp_prec = np.interp(MEAN_REC, rec_arr[::-1], prec_arr[::-1])
+                interp_precs.append(interp_prec)
+                aps.append(ap_val)
 
-    metrics_all = pd.concat(all_metrics).reset_index().rename(columns={"index": "Model"})
-    metrics_csv = os.path.join(OUT_DIR, "metrics_table_by_theta.csv")
-    metrics_all.to_csv(metrics_csv, index=False, float_format="%.4f")
+            mean_prec = np.mean(interp_precs, axis=0)
+            std_prec  = np.std(interp_precs, axis=0)
+            mean_ap   = np.mean(aps)
+            std_ap    = np.std(aps)
 
-    # 6) Confusion matrices (θ=10)
-    # 6) Confusion matrices for each theta
-    cm_pdfs = []
-    for theta in THETAS:
-        _, _, Xa2_te_t = A2_scaled_by_theta[theta]
-        cm_pdf_t = os.path.join(OUT_DIR, f"confusion_matrices_theta{theta}.pdf")
-        plot_confusion_matrices(
-            models_smote, models_a2_by_theta[theta],
-            X_te_sm_scaled, y_te, Xa2_te_t,
-            title_suffix=f"θ={theta}", out_path=cm_pdf_t
+            color = METHOD_COLORS[method]
+            ax.plot(
+                MEAN_REC, mean_prec, color=color, lw=PAPER_LINEWIDTH,
+                label=f"{method}  ({mean_ap:.3f}±{std_ap:.3f})",
+            )
+            ax.fill_between(
+                MEAN_REC,
+                np.clip(mean_prec - std_prec, 0, 1),
+                np.clip(mean_prec + std_prec, 0, 1),
+                color=color, alpha=PAPER_ALPHA,
+            )
+
+        ax.set_title(model, fontsize=PAPER_TITLE_FONT, fontweight="bold")
+        ax.set_xlabel("Recall",    fontsize=PAPER_FONT)
+        ax.set_ylabel("Precision", fontsize=PAPER_FONT)
+        ax.tick_params(labelsize=PAPER_FONT - 1)
+        ax.legend(fontsize=PAPER_FONT - 2, loc="lower left",
+                  framealpha=0.9, edgecolor="grey")
+
+    for j in range(len(models), len(axes_flat)):
+        axes_flat[j].set_visible(False)
+
+    fig.suptitle(
+        f"{dataset} — Mean PR Curves (5×2 CV, 10 folds)",
+        fontsize=PAPER_TITLE_FONT + 1, fontweight="bold",
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(out_path, dpi=PAPER_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_confusion_matrices_avg(cm_store: dict, out_path: str, dataset: str):
+    """Method × Model confusion matrix grid, paper-ready."""
+    methods = METHOD_ORDER
+    models  = sorted({k[1] for k in cm_store})
+
+    fig, axes = plt.subplots(
+        len(methods), len(models),
+        figsize=(4.5 * len(models), 3.8 * len(methods)),
+        squeeze=False,
+    )
+
+    for r, method in enumerate(methods):
+        for c, model in enumerate(models):
+            ax  = axes[r, c]
+            key = (method, model)
+            if key in cm_store and cm_store[key]:
+                normed = []
+                for cm in cm_store[key]:
+                    row_sums = cm.sum(axis=1, keepdims=True)
+                    row_sums = np.where(row_sums == 0, 1, row_sums)
+                    normed.append(cm / row_sums)
+                mean_cm = np.mean(normed, axis=0)
+                sns.heatmap(
+                    mean_cm, annot=True, fmt=".3f", cmap="Blues",
+                    ax=ax, cbar=False, vmin=0, vmax=1,
+                    annot_kws={"size": PAPER_FONT - 1},
+                )
+            ax.set_title(f"{method} — {model}",
+                         fontsize=PAPER_FONT, fontweight="bold")
+            ax.set_xlabel("Predicted", fontsize=PAPER_FONT - 1)
+            ax.set_ylabel("True",      fontsize=PAPER_FONT - 1)
+            ax.tick_params(labelsize=PAPER_FONT - 2)
+
+    fig.suptitle(
+        f"{dataset} — Mean Normalised Confusion Matrices (10 folds)",
+        fontsize=PAPER_TITLE_FONT + 1, fontweight="bold",
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig(out_path, dpi=PAPER_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_metric_boxplots(results_df: pd.DataFrame, out_path: str, dataset: str):
+    """Stacked vertical boxplots — one metric per row, paper-ready."""
+    metrics = ["AUC", "F1", "PR_AUC"]
+    fig, axes = plt.subplots(
+        len(metrics), 1,
+        figsize=(12, 4.5 * len(metrics)),
+        squeeze=False,
+    )
+
+    for i, metric in enumerate(metrics):
+        ax = axes[i, 0]
+        sns.boxplot(
+            data=results_df, x="Model", y=metric, hue="Method",
+            hue_order=METHOD_ORDER, ax=ax, palette=METHOD_COLORS,
+            linewidth=1.2, fliersize=3,
         )
-        cm_pdfs.append((theta, cm_pdf_t))
+        ax.set_title(metric, fontsize=PAPER_TITLE_FONT, fontweight="bold")
+        ax.set_xlabel("Classifier", fontsize=PAPER_FONT)
+        ax.set_ylabel(metric,       fontsize=PAPER_FONT)
+        ax.tick_params(labelsize=PAPER_FONT - 1)
+        ax.legend(fontsize=PAPER_FONT - 2, loc="best",
+                  framealpha=0.9, edgecolor="grey")
 
-    # 7) ROC curves for θ ∈ {2,5,10}
-    roc_pdf = os.path.join(OUT_DIR, "roc_multi_theta.pdf")
-    plot_roc_curves(SM=( (X_tr_res_scaled, y_tr_res), X_te_sm_scaled, y_te ),
-                    A2_by_theta=A2_scaled_by_theta,
-                    models=models_dict,
-                    out_path=roc_pdf)
+    fig.suptitle(
+        f"{dataset} — Metric Distribution (5×2 CV)",
+        fontsize=PAPER_TITLE_FONT + 1, fontweight="bold",
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig(out_path, dpi=PAPER_DPI, bbox_inches="tight")
+    plt.close(fig)
 
-    # 7b) Precision–Recall curves for θ ∈ {2,5,10}
-    pr_pdf = os.path.join(OUT_DIR, "precision-recall_curves.pdf")
-    plot_pr_curves(SM=((X_tr_res_scaled, y_tr_res), X_te_sm_scaled, y_te),
-                   A2_by_theta=A2_scaled_by_theta,
-                   models=models_dict,
-                   out_path=pr_pdf)
 
-    # 8) Copula samples & overlays
-    copula_pdf = os.path.join(OUT_DIR, "myplots.pdf")
-    minority_train_only = train_min.copy()
-    plot_copula_samples_and_overlays(minority_df=minority_train_only, thetas=THETAS,
-                                     feature_1=FEATURE_1, feature_2=FEATURE_2,
-                                     n_samples=500, out_path=copula_pdf)
+def plot_heatmap(results_df: pd.DataFrame, out_path: str, dataset: str):
+    """Method × Model heatmap for mean AUC, paper-ready."""
+    pivot = (
+        results_df.groupby(["Method", "Model"])["AUC"]
+        .mean()
+        .unstack()
+        .reindex(METHOD_ORDER)
+    )
 
-    # 9) McNemar’s test per model and per theta (A2 θ vs SMOTE) on SAME test set
-    mcnemar_summaries = []
-    for theta in THETAS:
-        _, _, Xa2_te_t = A2_scaled_by_theta[theta]
-        for model_name in ["RF", "MLP", "XGB"]:  # adjust list if desired
-            sm = models_smote[model_name]
-            a2 = models_a2_by_theta[theta][model_name]
+    fig, ax = plt.subplots(figsize=(10, 5))
+    sns.heatmap(
+        pivot, annot=True, fmt=".4f", cmap="YlGnBu",
+        ax=ax, linewidths=0.6,
+        annot_kws={"size": PAPER_FONT},
+        cbar_kws={"shrink": 0.8},
+    )
+    ax.set_title(
+        f"{dataset} — Mean AUC (5×2 CV)",
+        fontsize=PAPER_TITLE_FONT, fontweight="bold",
+    )
+    ax.tick_params(labelsize=PAPER_FONT)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=PAPER_DPI, bbox_inches="tight")
+    plt.close(fig)
 
-            yhat_sm = sm.predict(X_te_sm_scaled)
-            yhat_a2 = a2.predict(Xa2_te_t)
 
-            a2_correct = (yhat_a2 == y_te)
-            sm_correct = (yhat_sm == y_te)
 
-            n01 = int(np.sum(a2_correct & ~sm_correct))  # A2 only correct
-            n10 = int(np.sum(~a2_correct & sm_correct))  # SMOTE only correct
-            n11 = int(np.sum(a2_correct & sm_correct))
-            n00 = int(np.sum(~a2_correct & ~sm_correct))
+# 5×2 CV PAIRED t-TEST  (Dietterich, 1998)
 
-            table = np.array([[n11, n10],
-                              [n01, n00]], dtype=int)
+def dietterich_5x2_test(scores_a: list, scores_b: list):
+    """Proper 5×2 CV paired t-test (Dietterich, 1998).
 
-            # Use exact two-sided
-            mc = mcnemar(table, exact=True)
-            chi2_val = float(mc.statistic) if mc.statistic is not None else float("nan")
+    scores_a, scores_b : lists of length 10 (5 iterations × 2 folds).
 
-            json_path = os.path.join(OUT_DIR, f"mcnemar_{model_name}_theta{theta}.json")
-            fig_path = os.path.join(OUT_DIR, f"mcnemar_contingency_{model_name}_theta{theta}.pdf")
+    The numerator uses diffs[0] — the difference from the first fold of
+    the first iteration only. This is intentional and matches the original
+    Dietterich (1998) formulation exactly; it is NOT the mean of all diffs.
 
-            with open(json_path, "w") as f:
-                json.dump({
-                    "model": model_name,
-                    "theta": theta,
-                    "contingency_table": {
-                        "n11_both_correct": n11,
-                        "n10_smote_only_correct": n10,
-                        "n01_a2_only_correct": n01,
-                        "n00_both_incorrect": n00
-                    },
-                    "statistic": chi2_val,
-                    "p_value": float(mc.pvalue)
-                }, f, indent=2)
+    Returns (t_statistic, p_value).
+    """
+    assert len(scores_a) == 10 and len(scores_b) == 10
 
-            plot_mcnemar_contingency(table, chi2=chi2_val, p=float(mc.pvalue), out_path=fig_path)
-            mcnemar_summaries.append((theta, model_name, json_path, fig_path, n10, n01, float(mc.pvalue)))
+    diffs = [a - b for a, b in zip(scores_a, scores_b)]
 
-    # 10) Save a short README with paths
-    with open(os.path.join(OUT_DIR, "README.txt"), "w", encoding="utf-8") as f:
-        f.write("Outputs generated by CopulaSMOTE revision pipeline\n")
-        f.write(f"- Metrics table (all thetas): {metrics_csv}\n")
-        for theta, cm_pdf_t in cm_pdfs:
-            f.write(f"- Confusion matrices (θ={theta}): {cm_pdf_t}\n")
-        f.write(f"- ROC curves (θ in {THETAS}): {roc_pdf}\n")
-        f.write(f"- Precision–Recall curves (θ in {THETAS}): {pr_pdf}\n")
-        f.write(f"- Copula sample plots: {copula_pdf}\n")
-        for theta, model_name, json_path, fig_path, n10, n01, p in mcnemar_summaries:
-            f.write(f"- McNemar ({model_name}, θ={theta}): n10={n10}, n01={n01}, p={p:.4g}\n")
-            f.write(f"  JSON: {json_path}\n")
-            f.write(f"  Figure: {fig_path}\n")
+    s2 = []
+    for i in range(5):
+        d1   = diffs[2 * i]
+        d2   = diffs[2 * i + 1]
+        p_i  = (d1 + d2) / 2.0
+        s2_i = (d1 - p_i) ** 2 + (d2 - p_i) ** 2
+        s2.append(s2_i)
 
-    print("✓ Done. Outputs written to:", OUT_DIR)
+    numerator   = diffs[0]                       # per Dietterich (1998)
+    denominator = np.sqrt(np.mean(s2))
 
+    if denominator < 1e-15:
+        return 0.0, 1.0
+
+    t_stat  = numerator / denominator
+    p_value = 2 * sp_stats.t.sf(abs(t_stat), df=5)
+    return float(t_stat), float(p_value)
+
+
+# BASELINE RESAMPLERS
+
+def get_classical_resampled_sets(
+    X_tr_sc: np.ndarray, y_tr: np.ndarray, seed: int
+) -> dict:
+    """Returns dict: method_name -> (X_resampled, y_resampled).
+
+    Restricted to pure interpolation-based oversamplers:
+      SMOTE, BorderlineSMOTE, ADASYN.
+    Hybrid editing methods (e.g. SMOTEENN) are excluded by design.
+    """
+    resampled = {}
+
+    resampled["SMOTE"] = SMOTE(random_state=seed).fit_resample(X_tr_sc, y_tr)
+
+    resampled["BorderlineSMOTE"] = BorderlineSMOTE(
+        random_state=seed, kind="borderline-1"
+    ).fit_resample(X_tr_sc, y_tr)
+
+    try:
+        resampled["ADASYN"] = ADASYN(random_state=seed).fit_resample(X_tr_sc, y_tr)
+    except (RuntimeError, ValueError):
+        # Fall back to SMOTE on degenerate neighbourhood conditions
+        print("    [ADASYN] Degenerate neighbourhood — falling back to SMOTE.")
+        resampled["ADASYN"] = SMOTE(random_state=seed).fit_resample(X_tr_sc, y_tr)
+
+    return resampled
+
+
+# MAIN EXPERIMENT
+
+
+def run_experiment(dataset_name: str):
+    dataset_name = dataset_name.upper()
+    assert dataset_name in CONFIGS, (
+        f"Unknown dataset '{dataset_name}'. Choose from: {list(CONFIGS.keys())}"
+    )
+
+    out_dir = f"results_{dataset_name.lower()}"
+    os.makedirs(out_dir, exist_ok=True)
+
+    print(f"\n{'='*70}")
+    print(f"  DATASET : {dataset_name}")
+    print(f"{'='*70}")
+
+    X, y, feat_cols = load_dataset(dataset_name)
+    has_missing     = X.isnull().any().any()
+
+    # Global minority class — fixed for ALL folds 
+    # Using a single global definition ensures minority-focused metrics
+    # (F1_min, Rec_min, etc.) are computed on the same label throughout,
+    # even if fold-level class counts differ slightly.
+    global_counts  = pd.Series(y).value_counts()
+    minority_global = int(global_counts.idxmin())
+    majority_global = int(global_counts.idxmax())
+
+    print(f"  Shape          : {X.shape}")
+    print(f"  Class balance  : {dict(zip(*np.unique(y, return_counts=True)))}")
+    print(f"  Minority class : {minority_global} "
+          f"(n={global_counts[minority_global]}, "
+          f"{100*global_counts[minority_global]/len(y):.1f}%)")
+    if has_missing:
+        print(f"  Missing values : {X.isnull().sum().sum()} (imputed per fold)")
+    print()
+
+    all_results = []
+    cv_scores   = {}   # (model, method, metric) -> list[10 floats]
+    all_roc     = {}   # (method, model) -> list[(fpr, tpr, auc)]
+    all_pr      = {}   # (method, model) -> list[(prec, rec, ap)]
+    all_cm      = {}   # (method, model) -> list[cm arrays]
+
+    for iteration in range(5):
+        kf = StratifiedKFold(
+            n_splits=2, shuffle=True, random_state=SEED + iteration
+        )
+
+        for fold, (train_idx, test_idx) in enumerate(kf.split(X, y)):
+            fold_id = iteration * 2 + fold + 1
+            print(f"  Iteration {iteration+1}/5, Fold {fold+1}/2  "
+                  f"(global fold {fold_id}/10)")
+
+            seed = SEED + iteration * 10 + fold
+
+            X_tr = X.iloc[train_idx].copy()
+            X_te = X.iloc[test_idx].copy()
+            y_tr = y[train_idx].copy()
+            y_te = y[test_idx].copy()
+
+            # Impute missing (train-only fit) 
+            if has_missing:
+                imputer = SimpleImputer(strategy="median")
+                X_tr = pd.DataFrame(
+                    imputer.fit_transform(X_tr),
+                    columns=feat_cols, index=X_tr.index,
+                )
+                X_te = pd.DataFrame(
+                    imputer.transform(X_te),
+                    columns=feat_cols, index=X_te.index,
+                )
+
+            # Scale (train-only fit) 
+            scaler   = StandardScaler().fit(X_tr)
+            X_tr_sc  = scaler.transform(X_tr)
+            X_te_sc  = scaler.transform(X_te)
+
+            df_tr = pd.DataFrame(X_tr_sc, columns=feat_cols)
+            df_tr["_TARGET_"] = y_tr
+
+            # Oversampling amount — use global minority label 
+            counts        = pd.Series(y_tr).value_counts()
+            n_minority_tr = counts.get(minority_global, 0)
+            n_majority_tr = counts.get(majority_global, 0)
+            n_synth       = int(n_majority_tr - n_minority_tr)
+
+            minority_df = (
+                df_tr[df_tr["_TARGET_"] == minority_global]
+                .drop(columns="_TARGET_")
+            )
+
+            # Classical baselines 
+            classical_sets = get_classical_resampled_sets(
+                X_tr_sc, y_tr, seed=seed
+            )
+
+            # Normalizing Flow 
+            flow_model = train_flow(minority_df.values, seed=seed)
+            synth_flow = gen_flow(flow_model, n_synth, feat_cols, seed=seed)
+            synth_flow["_TARGET_"] = minority_global
+            flow_train = (
+                pd.concat([df_tr, synth_flow], ignore_index=True)
+                .sample(frac=1, random_state=seed)
+                .reset_index(drop=True)
+            )
+            X_flow = flow_train.drop(columns="_TARGET_").values
+            y_flow = flow_train["_TARGET_"].values
+
+            # Vine Copula 
+            synth_vine = gen_vine(minority_df, n_synth, seed=seed)
+            synth_vine["_TARGET_"] = minority_global
+            vine_train = (
+                pd.concat([df_tr, synth_vine], ignore_index=True)
+                .sample(frac=1, random_state=seed)
+                .reset_index(drop=True)
+            )
+            X_vine = vine_train.drop(columns="_TARGET_").values
+            y_vine = vine_train["_TARGET_"].values
+
+            # Collect all training sets 
+            method_datasets = []
+            for method_name in ["SMOTE", "BorderlineSMOTE", "ADASYN"]:
+                X_aug, y_aug = classical_sets[method_name]
+                method_datasets.append((method_name, X_aug, y_aug))
+            method_datasets.extend([
+                ("Flow", X_flow, y_flow),
+                ("CopulaSMOTE", X_vine, y_vine),
+            ])
+
+            # Train & Evaluate 
+            models = get_models(seed)
+
+            for method, X_aug, y_aug in method_datasets:
+                for name, model in models.items():
+                    m = clone(model)
+                    m.fit(X_aug, y_aug)
+
+                    pred    = m.predict(X_te_sc)
+                    prob    = m.predict_proba(X_te_sc)[:, 1]
+
+                    f1_val  = f1_score(y_te, pred, zero_division=0)
+                    auc_val = roc_auc_score(y_te, prob)
+                    ap_val  = average_precision_score(y_te, prob)
+
+                    # Minority-class-focused metrics — use global minority label
+                    f1_min   = f1_score(
+                        y_te, pred, pos_label=minority_global, zero_division=0
+                    )
+                    prec_min = precision_score(
+                        y_te, pred, pos_label=minority_global, zero_division=0
+                    )
+                    rec_min  = recall_score(
+                        y_te, pred, pos_label=minority_global, zero_division=0
+                    )
+                    prob_min = prob if minority_global == 1 else (1.0 - prob)
+                    ap_min   = average_precision_score(
+                        (y_te == minority_global).astype(int), prob_min
+                    )
+
+                    all_results.append({
+                        "Iteration" : iteration + 1,
+                        "Fold"      : fold + 1,
+                        "Method"    : method,
+                        "Model"     : name,
+                        "Acc"       : accuracy_score(y_te, pred),
+                        "BalAcc"    : balanced_accuracy_score(y_te, pred),
+                        "Prec"      : precision_score(y_te, pred, zero_division=0),
+                        "Rec"       : recall_score(y_te, pred, zero_division=0),
+                        "F1"        : f1_val,
+                        "AUC"       : auc_val,
+                        "PR_AUC"    : ap_val,
+                        "F1_min"    : f1_min,
+                        "Prec_min"  : prec_min,
+                        "Rec_min"   : rec_min,
+                        "PR_AUC_min": ap_min,
+                    })
+
+                    for met_name, met_val in [
+                        ("AUC", auc_val), ("F1", f1_val), ("PR_AUC", ap_val)
+                    ]:
+                        cv_scores.setdefault(
+                            (name, method, met_name), []
+                        ).append(met_val)
+
+                    fpr, tpr, _ = roc_curve(y_te, prob)
+                    all_roc.setdefault((method, name), []).append(
+                        (fpr, tpr, auc_val)
+                    )
+
+                    prec_c, rec_c, _ = precision_recall_curve(y_te, prob)
+                    all_pr.setdefault((method, name), []).append(
+                        (prec_c, rec_c, ap_val)
+                    )
+
+                    all_cm.setdefault((method, name), []).append(
+                        confusion_matrix(y_te, pred)
+                    )
+
+    # RESULTS
+
+    results_df = pd.DataFrame(all_results)
+
+    # Raw per-fold results
+    raw_path = os.path.join(out_dir, f"{dataset_name.lower()}_all_runs.csv")
+    results_df.to_csv(raw_path, index=False)
+
+    # Summary (mean ± std)
+    metric_cols = [
+        "Acc", "BalAcc", "Prec", "Rec", "F1", "AUC", "PR_AUC",
+        "F1_min", "Prec_min", "Rec_min", "PR_AUC_min",
+    ]
+    summary = (
+        results_df.groupby(["Method", "Model"])[metric_cols]
+        .agg(["mean", "std"])
+        .reset_index()
+    )
+    summary.columns = ["_".join(c).strip("_") for c in summary.columns]
+
+    for m in metric_cols:
+        summary[m] = (
+            summary[f"{m}_mean"].round(4).astype(str)
+            + " ± "
+            + summary[f"{m}_std"].round(4).astype(str)
+        )
+
+    summary_path = os.path.join(
+        out_dir, f"{dataset_name.lower()}_summary.csv"
+    )
+    summary.to_csv(summary_path, index=False)
+
+    pd.set_option("display.max_columns", None)
+    pd.set_option("display.width", 260)
+    print(f"\n{'='*70}")
+    print(f"  RESULTS — {dataset_name}  (mean ± std over 10 folds)")
+    print(f"{'='*70}\n")
+    print(summary[["Method", "Model"] + metric_cols].to_string(index=False))
+
+    # 5×2 CV paired t-test (Dietterich) 
+    print(f"\n{'='*70}")
+    print(f"  5×2 CV PAIRED t-TEST  (Dietterich, 1998)")
+    print(f"{'='*70}\n")
+
+    stat_rows   = []
+    model_names = sorted(results_df["Model"].unique())
+
+    for model_name in model_names:
+        for baseline in ["SMOTE", "BorderlineSMOTE", "ADASYN", "Flow"]:
+            for metric in ["AUC", "F1", "PR_AUC"]:
+                vine_key = (model_name, "CopulaSMOTE",   metric)
+                base_key = (model_name, baseline, metric)
+
+                if vine_key not in cv_scores or base_key not in cv_scores:
+                    continue
+
+                t_stat, p_val = dietterich_5x2_test(
+                    cv_scores[vine_key], cv_scores[base_key]
+                )
+                vine_mean = np.mean(cv_scores[vine_key])
+                base_mean = np.mean(cv_scores[base_key])
+
+                sig = (
+                    "***" if p_val < 0.01 else
+                    "**"  if p_val < 0.05 else
+                    "*"   if p_val < 0.10 else ""
+                )
+
+                stat_rows.append({
+                    "Model"      : model_name,
+                    "Metric"     : metric,
+                    "Comparison" : f"CopulaSMOTE vs {baseline}",
+                    "Vine_mean"  : round(vine_mean, 4),
+                    "Base_mean"  : round(base_mean, 4),
+                    "Diff"       : round(vine_mean - base_mean, 4),
+                    "t_stat"     : round(t_stat, 3),
+                    "p_value"    : round(p_val,  4),
+                    "Sig"        : sig,
+                })
+
+                print(
+                    f"  {model_name:4s} | {metric:6s} | "
+                    f"CopulaSMOTE vs {baseline:15s} | "
+                    f"Δ = {vine_mean - base_mean:+.4f} | "
+                    f"t = {t_stat:+.3f} | p = {p_val:.4f} {sig}"
+                )
+
+    stats_df   = pd.DataFrame(stat_rows)
+    stats_path = os.path.join(
+        out_dir, f"{dataset_name.lower()}_stat_tests.csv"
+    )
+    stats_df.to_csv(stats_path, index=False)
+
+    # Plots 
+    print("\n  Generating plots...")
+
+    plot_roc_curves_averaged(
+        all_roc,
+        os.path.join(out_dir, f"{dataset_name.lower()}_roc_curves.pdf"),
+        dataset_name,
+    )
+    plot_pr_curves_averaged(
+        all_pr,
+        os.path.join(out_dir, f"{dataset_name.lower()}_pr_curves.pdf"),
+        dataset_name,
+    )
+    plot_confusion_matrices_avg(
+        all_cm,
+        os.path.join(out_dir, f"{dataset_name.lower()}_confusion.pdf"),
+        dataset_name,
+    )
+    plot_metric_boxplots(
+        results_df,
+        os.path.join(out_dir, f"{dataset_name.lower()}_metric_boxplots.pdf"),
+        dataset_name,
+    )
+    plot_heatmap(
+        results_df,
+        os.path.join(out_dir, f"{dataset_name.lower()}_heatmap.pdf"),
+        dataset_name,
+    )
+
+    print(f"\n  All outputs saved to ./{out_dir}/")
+    print("  Done.\n")
+
+
+
+# ENTRY POINT
 
 if __name__ == "__main__":
-    if DATA_CSV == "/path/to/your/pima_diabetes_data.csv":
-        print("Please edit DATA_CSV in this script to point to your CSV and run again.")
-    else:
-        main()
+    ds = sys.argv[1].upper() if len(sys.argv) > 1 else "CDC"
+    assert ds in CONFIGS, (
+        f"Unknown dataset '{ds}'. Choose from: {list(CONFIGS.keys())}"
+    )
+    run_experiment(ds)
