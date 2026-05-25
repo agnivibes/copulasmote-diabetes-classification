@@ -3,7 +3,7 @@
 [![Python](https://img.shields.io/badge/Python-3.11+-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![scikit-learn](https://img.shields.io/badge/ML-scikit--learn%20%7C%20XGBoost%20%7C%20LogReg-orange)](https://scikit-learn.org/stable/)
 [![Copulas](https://img.shields.io/badge/Dependency%20Modeling-Vine%20Copulas-6f42c1)](https://en.wikipedia.org/wiki/Copula_(probability_theory))
-[![SMOTE](https://img.shields.io/badge/Oversampling-SMOTE%20%7C%20Vine-ff69b4)](https://imbalanced-learn.org/stable/references/generated/imblearn.over_sampling.SMOTE.html)
+[![SMOTE](https://img.shields.io/badge/Oversampling-SMOTE%20%7C%20-ff69b4)](https://imbalanced-learn.org/stable/references/generated/imblearn.over_sampling.SMOTE.html)
 
 This repository contains the implementation of a machine learning pipeline that addresses class imbalance in diabetes classification by leveraging copula-based data generation. We fit a truncated vine copula to the minority class, simulate synthetic samples that preserve its joint dependence structure, and compare this approach against classical interpolation-based oversamplers (SMOTE, Borderline-SMOTE, ADASYN) and a normalizing-flow baseline.
 
