@@ -52,7 +52,7 @@ If you use this code or method in your own work, please cite:
 For questions or collaborations, feel free to contact:
 
 <!-- TODO: replace placeholder email before publishing -->
-Repository contact — Agnideep Aich, Department of Emergency Medicine, Stanford University School of Medicine
+Repository contact — Agnideep Aich, Department of Emergency Medicine, Stanford University 
 📧 agnideep@stanford.edu
 
 Corresponding author — Sameera Hewage, Department of Mathematics, Southern Utah University
